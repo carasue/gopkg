@@ -31,6 +31,7 @@ type cache struct {
 	mu   sync.RWMutex
 	list *list
 	m    map[interface{}]uint32
+	top  *topk
 
 	buf  unsafe.Pointer // *walbuf
 	_buf unsafe.Pointer // *walbuf
@@ -44,6 +45,22 @@ type walbuf struct {
 	p int32
 }
 
+func (c *cache) EnableTopk(size int, window time.Duration) {
+	c.mu.Lock()
+	provider := func(k interface{}) (v interface{}, expires int64, ok bool) {
+		c.mu.RLock()
+		_, elem, ok := c.get(k)
+		if ok {
+			v = elem.value
+			expires = elem.expires
+		}
+		c.mu.RUnlock()
+		return
+	}
+	c.top = newTopk(size, window, provider)
+	c.mu.Unlock()
+}
+
 func (c *cache) Len() (n int) {
 	c.mu.RLock()
 	n = len(c.m)
@@ -52,6 +69,14 @@ func (c *cache) Len() (n int) {
 }
 
 func (c *cache) Get(key interface{}) (v interface{}, exists, expired bool) {
+	if c.top != nil {
+		c.top.touch(key)
+		v, exists, expired = c.top.get(key)
+		if exists {
+			return
+		}
+	}
+
 	c.mu.RLock()
 	idx, elem, exists := c.get(key)
 	if exists {
@@ -64,6 +89,13 @@ func (c *cache) Get(key interface{}) (v interface{}, exists, expired bool) {
 }
 
 func (c *cache) GetQuiet(key interface{}) (v interface{}, exists, expired bool) {
+	if c.top != nil {
+		v, exists, expired = c.top.get(key)
+		if exists {
+			return
+		}
+	}
+
 	c.mu.RLock()
 	_, elem, exists := c.get(key)
 	if exists {
@@ -102,6 +134,9 @@ func (c *cache) MGetInt64(keys []int64) map[int64]interface{} {
 	res := make(map[int64]interface{}, len(keys))
 	c.mu.RLock()
 	for _, key := range keys {
+		if c.top != nil {
+			c.top.touch(key)
+		}
 		idx, exists := c.m[key]
 		if exists {
 			elem := &c.elems[idx]
@@ -117,6 +152,9 @@ func (c *cache) MGetString(keys []string) map[string]interface{} {
 	res := make(map[string]interface{}, len(keys))
 	c.mu.RLock()
 	for _, key := range keys {
+		if c.top != nil {
+			c.top.touch(key)
+		}
 		idx, exists := c.m[key]
 		if exists {
 			elem := &c.elems[idx]
@@ -176,6 +214,10 @@ func (c *cache) Set(key, value interface{}, ttl time.Duration) {
 	c.checkAndFlushBuf()
 	c.set(key, value, expires)
 	c.mu.Unlock()
+
+	if c.top != nil {
+		c.top.del(key)
+	}
 }
 
 func (c *cache) MSet(kvmap interface{}, ttl time.Duration) {
@@ -188,9 +230,13 @@ func (c *cache) MSet(kvmap interface{}, ttl time.Duration) {
 
 	c.mu.Lock()
 	c.checkAndFlushBuf()
-	for _, key := range keys {
-		value := m.MapIndex(key)
-		c.set(key.Interface(), value.Interface(), expires)
+	for _, rkey := range keys {
+		key := rkey.Interface()
+		value := m.MapIndex(rkey).Interface()
+		c.set(key, value, expires)
+		if c.top != nil {
+			c.top.del(key)
+		}
 	}
 	c.mu.Unlock()
 }
@@ -220,6 +266,10 @@ func (c *cache) Del(key interface{}) {
 	c.checkAndFlushBuf()
 	c.del(key)
 	c.mu.Unlock()
+
+	if c.top != nil {
+		c.top.del(key)
+	}
 }
 
 func (c *cache) MDelInt64(keys []int64) {
@@ -227,6 +277,9 @@ func (c *cache) MDelInt64(keys []int64) {
 	c.checkAndFlushBuf()
 	for _, key := range keys {
 		c.del(key)
+		if c.top != nil {
+			c.top.del(key)
+		}
 	}
 	c.mu.Unlock()
 }
@@ -236,6 +289,9 @@ func (c *cache) MDelString(keys []string) {
 	c.checkAndFlushBuf()
 	for _, key := range keys {
 		c.del(key)
+		if c.top != nil {
+			c.top.del(key)
+		}
 	}
 	c.mu.Unlock()
 }
